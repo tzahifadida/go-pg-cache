@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -16,47 +17,45 @@ import (
 	"github.com/tzahifadida/pgln"
 )
 
-type CacheableRow[ID comparable] interface {
-	GetID() ID
-	GetUpdatedAt() time.Time
+type Cache[C any, ID comparable] struct {
+	db                  *sqlx.DB
+	pgln                *pgln.PGListenNotify
+	cache               map[ID]*list.Element
+	lru                 *list.List
+	mutex               sync.RWMutex
+	schema              string
+	tableName           string
+	outOfSync           bool
+	channelName         string
+	nodeID              uuid.UUID
+	customPGLN          bool
+	maxSize             int
+	ctx                 context.Context
+	logger              Logger
+	idField             reflect.StructField
+	updatedAtField      reflect.StructField
+	idFieldName         string
+	updatedAtFieldName  string
+	idColumnName        string
+	updatedAtColumnName string
+	idColumnType        string
 }
 
-type Cache[C CacheableRow[ID], ID comparable] struct {
-	db              *sqlx.DB
-	pgln            *pgln.PGListenNotify
-	cache           map[ID]*list.Element
-	lru             *list.List
-	mutex           sync.RWMutex
-	schema          string
-	tableName       string
-	idColumn        string
-	updatedAtColumn string
-	outOfSync       bool
-	channelName     string
-	nodeID          uuid.UUID
-	customPGLN      bool
-	maxSize         int
-	ctx             context.Context
-	idColumnType    string
-	logger          Logger
-}
-
-// Logger defines the interface for logging operations.
 type Logger interface {
 	Debug(msg string, args ...any)
 	Error(msg string, args ...any)
 }
 
 type CacheConfig struct {
-	Schema          string
-	TableName       string
-	IDColumn        string
-	UpdatedAtColumn string
-	ChannelName     string
-	CustomPGLN      *pgln.PGListenNotify
-	MaxSize         int
-	Context         context.Context
-	Logger          Logger
+	Schema             string
+	TableName          string
+	ChannelName        string
+	CustomPGLN         *pgln.PGListenNotify
+	MaxSize            int
+	Context            context.Context
+	Logger             Logger
+	IDFieldName        string
+	UpdatedAtFieldName string
 }
 
 type cacheItem[C any, ID comparable] struct {
@@ -70,7 +69,7 @@ type CacheNotification[ID comparable] struct {
 	IDs    []ID
 }
 
-func NewCache[C CacheableRow[ID], ID comparable](db *sqlx.DB, config CacheConfig) (*Cache[C, ID], error) {
+func NewCache[C any, ID comparable](db *sqlx.DB, config CacheConfig) (*Cache[C, ID], error) {
 	var pglnInstance *pgln.PGListenNotify
 	var err error
 
@@ -102,32 +101,54 @@ func NewCache[C CacheableRow[ID], ID comparable](db *sqlx.DB, config CacheConfig
 		config.Schema = "public"
 	}
 
-	idColumnType, err := getColumnType(db, config.Schema, config.TableName, config.IDColumn)
+	var zero C
+	t := reflect.TypeOf(zero)
+	if t.Kind() != reflect.Struct {
+		return nil, fmt.Errorf("C must be a struct type")
+	}
+
+	idField, updatedAtField, idColumnName, updateAtColumnName, err :=
+		findFields(t, config.IDFieldName, config.UpdatedAtFieldName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find required fields: %w", err)
+	}
+
+	var timePointer *time.Time
+	if updatedAtField.Type != reflect.TypeOf(time.Time{}) && updatedAtField.Type != reflect.TypeOf(timePointer) {
+		return nil, fmt.Errorf("field %s is not of type time.Time", config.UpdatedAtFieldName)
+	}
+
+	idColumnType, err := getColumnType(db, config.Schema, config.TableName, idColumnName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get ID column type: %w", err)
 	}
 
 	cache := &Cache[C, ID]{
-		db:              db,
-		pgln:            pglnInstance,
-		cache:           make(map[ID]*list.Element),
-		lru:             list.New(),
-		schema:          config.Schema,
-		tableName:       config.TableName,
-		idColumn:        config.IDColumn,
-		updatedAtColumn: config.UpdatedAtColumn,
-		channelName:     config.ChannelName,
-		nodeID:          nodeID,
-		customPGLN:      config.CustomPGLN != nil,
-		maxSize:         config.MaxSize,
-		ctx:             config.Context,
-		logger:          config.Logger,
-		idColumnType:    idColumnType,
+		db:                  db,
+		pgln:                pglnInstance,
+		cache:               make(map[ID]*list.Element),
+		lru:                 list.New(),
+		schema:              config.Schema,
+		tableName:           config.TableName,
+		channelName:         config.ChannelName,
+		nodeID:              nodeID,
+		customPGLN:          config.CustomPGLN != nil,
+		maxSize:             config.MaxSize,
+		ctx:                 config.Context,
+		logger:              config.Logger,
+		idField:             idField,
+		updatedAtField:      updatedAtField,
+		idFieldName:         config.IDFieldName,
+		updatedAtFieldName:  config.UpdatedAtFieldName,
+		idColumnName:        idColumnName,
+		updatedAtColumnName: updateAtColumnName,
+		idColumnType:        idColumnType,
 	}
 
 	if cache.logger == nil {
 		cache.logger = slog.Default()
 	}
+
 	err = pglnInstance.ListenAndWaitForListening(config.ChannelName, pgln.ListenOptions{
 		NotificationCallback: cache.handleNotification,
 		ErrorCallback: func(channel string, err error) {
@@ -145,7 +166,6 @@ func NewCache[C CacheableRow[ID], ID comparable](db *sqlx.DB, config CacheConfig
 
 	return cache, nil
 }
-
 func getColumnType(db *sqlx.DB, schema, table, column string) (string, error) {
 	query := `
 		SELECT data_type 
@@ -158,6 +178,34 @@ func getColumnType(db *sqlx.DB, schema, table, column string) (string, error) {
 		return "", fmt.Errorf("failed to get column type: %w", err)
 	}
 	return dataType, nil
+}
+
+func findFields(t reflect.Type, idFieldName, updatedAtFieldName string) (reflect.StructField, reflect.StructField, string, string, error) {
+	var idField, updatedAtField reflect.StructField
+	var idTag, updatedAtTag string
+	var ok bool
+
+	// Find the idField by name and get its db tag
+	if idField, ok = t.FieldByName(idFieldName); !ok {
+		return reflect.StructField{}, reflect.StructField{}, "", "", fmt.Errorf("struct does not have a field named %s", idFieldName)
+	}
+
+	if idTag, ok = idField.Tag.Lookup("db"); !ok {
+		return reflect.StructField{}, reflect.StructField{}, "", "", fmt.Errorf("field %s does not have a 'db' tag", idFieldName)
+	}
+
+	// Find the updatedAtField by name and get its db tag
+	if updatedAtFieldName != "" {
+		if updatedAtField, ok = t.FieldByName(updatedAtFieldName); !ok {
+			return reflect.StructField{}, reflect.StructField{}, "", "", fmt.Errorf("struct does not have a field named %s", updatedAtFieldName)
+		}
+
+		if updatedAtTag, ok = updatedAtField.Tag.Lookup("db"); !ok {
+			return reflect.StructField{}, reflect.StructField{}, "", "", fmt.Errorf("field %s does not have a 'db' tag", updatedAtFieldName)
+		}
+	}
+
+	return idField, updatedAtField, idTag, updatedAtTag, nil
 }
 
 func (c *Cache[C, ID]) Get(ctx context.Context, id ID) (C, bool, error) {
@@ -186,23 +234,26 @@ func (c *Cache[C, ID]) Get(ctx context.Context, id ID) (C, bool, error) {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
-	// Always update the cache, even if we were previously out of sync
+	rowValue := reflect.ValueOf(row)
+	idValue := rowValue.FieldByIndex(c.idField.Index).Interface().(ID)
+
 	if el, exists := c.cache[id]; exists {
 		c.lru.MoveToFront(el)
-		el.Value = cacheItem[C, ID]{value: row, id: id}
+		el.Value = cacheItem[C, ID]{value: row, id: idValue}
 	} else {
 		if c.lru.Len() >= c.maxSize {
 			c.evict()
 		}
-		el := c.lru.PushFront(cacheItem[C, ID]{value: row, id: id})
-		c.cache[id] = el
+		el := c.lru.PushFront(cacheItem[C, ID]{value: row, id: idValue})
+		c.cache[idValue] = el
 	}
 
 	return row, true, nil
 }
 
 func (c *Cache[C, ID]) loadFromDB(ctx context.Context, id ID) (C, error) {
-	query := fmt.Sprintf(`SELECT * FROM "%s"."%s" WHERE "%s" = $1`, c.schema, c.tableName, c.idColumn)
+	query := fmt.Sprintf(`SELECT * FROM "%s"."%s" WHERE "%s" = $1`, c.schema, c.tableName, c.idColumnName)
+
 	var item C
 	err := c.db.GetContext(ctx, &item, query, id)
 	if err != nil {
@@ -280,7 +331,7 @@ func (c *Cache[C, ID]) handleOutOfSync(channel string) error {
 }
 
 func (c *Cache[C, ID]) refreshCache(ctx context.Context) error {
-	if c.updatedAtColumn == "" {
+	if c.updatedAtField.Index == nil {
 		c.ClearCache()
 		return nil
 	}
@@ -291,9 +342,10 @@ func (c *Cache[C, ID]) refreshCache(ctx context.Context) error {
 	c.mutex.RLock()
 	for id, el := range c.cache {
 		cachedIDs = append(cachedIDs, id)
-		itemUpdatedAt := el.Value.(cacheItem[C, ID]).value.GetUpdatedAt()
-		if itemUpdatedAt.After(mostRecentUpdate) {
-			mostRecentUpdate = itemUpdatedAt
+		itemValue := reflect.ValueOf(el.Value.(cacheItem[C, ID]).value)
+		updatedAt := itemValue.FieldByIndex(c.updatedAtField.Index).Interface().(time.Time)
+		if updatedAt.After(mostRecentUpdate) {
+			mostRecentUpdate = updatedAt
 		}
 	}
 	c.mutex.RUnlock()
@@ -311,18 +363,18 @@ func (c *Cache[C, ID]) refreshCache(ctx context.Context) error {
 			VALUES %s
 		)
 		SELECT existing.id FROM existing
-		LEFT JOIN "%s"."%s" t ON existing.id = t."%s"::%s
+		LEFT JOIN "%s"."%s" t ON existing.id = t."%s"
 		WHERE t."%s" IS NULL
 		UNION
 		SELECT t."%s" FROM "%s"."%s" t
-		JOIN existing ON t."%s" = existing.id::%s
+		JOIN existing ON t."%s" = existing.id
 		WHERE t."%s" > $%d
 	`, placeholders,
-		c.schema, c.tableName, c.idColumn, c.idColumnType,
-		c.idColumn,
-		c.idColumn, c.schema, c.tableName,
-		c.idColumn, c.idColumnType,
-		c.updatedAtColumn, len(cachedIDs)+1)
+		c.schema, c.tableName, c.idColumnName,
+		c.idColumnName,
+		c.idColumnName, c.schema, c.tableName,
+		c.idColumnName,
+		c.updatedAtColumnName, len(cachedIDs)+1)
 
 	args := make([]interface{}, len(cachedIDs)+1)
 	for i, id := range cachedIDs {

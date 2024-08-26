@@ -71,57 +71,52 @@ Here's a basic example of how to use `go-pg-cache`:
 
 ```go
 import (
-    "github.com/tzahifadida/go-pg-cache"
-    "github.com/jmoiron/sqlx"
-    "github.com/google/uuid"
+"github.com/tzahifadida/go-pg-cache"
+"github.com/jmoiron/sqlx"
+"github.com/google/uuid"
+"context"
+"log"
+"time"
+"fmt"
 )
 
 // Define your struct
 type User struct {
-    ID        uuid.UUID `db:"id"`
-    Name      string    `db:"name"`
-    UpdatedAt time.Time `db:"updated_at"`
-}
-
-// Implement CacheableRow interface
-func (u User) GetID() uuid.UUID {
-    return u.ID
-}
-
-func (u User) GetUpdatedAt() time.Time {
-    return u.UpdatedAt
+ID        uuid.UUID `db:"id"`
+Name      string    `db:"name"`
+UpdatedAt time.Time `db:"updated_at"`
 }
 
 // Initialize the cache
 db, _ := sqlx.Connect("pgx", "your_connection_string")
 config := gopgcache.CacheConfig{
-    Schema:          "public",
-    TableName:       "users",
-    IDColumn:        "id",
-    UpdatedAtColumn: "updated_at",
-    ChannelName:     "cache_invalidation",
-    MaxSize:         1000,
-    Context:         context.Background(),
+Schema:          "public",
+TableName:       "users",
+IDFieldName:     "ID",
+UpdatedAtFieldName: "UpdatedAt",
+ChannelName:     "cache_invalidation",
+MaxSize:         1000,
+Context:         context.Background(),
 }
 
 cache, err := gopgcache.NewCache[User, uuid.UUID](db, config)
 if err != nil {
-    log.Fatalf("Failed to create cache: %v", err)
+log.Fatalf("Failed to create cache: %v", err)
 }
 
 // Use the cache
 userID := uuid.New()
 user, exists, err := cache.Get(context.Background(), userID)
 if err != nil {
-    log.Printf("Error getting user: %v", err)
+log.Printf("Error getting user: %v", err)
 } else if exists {
-    fmt.Printf("User: %v\n", user)
+fmt.Printf("User: %v\n", user)
 }
 
 // Invalidate cache entries
 err = cache.NotifyRemove(userID, uuid.New(), uuid.New())
 if err != nil {
-    log.Printf("Error notifying removal: %v", err)
+log.Printf("Error notifying removal: %v", err)
 }
 ```
 
@@ -131,8 +126,8 @@ The `CacheConfig` struct allows you to customize the behavior of the cache:
 
 - `Schema`: The database schema name.
 - `TableName`: The name of the table being cached.
-- `IDColumn`: The name of the ID column in the table.
-- `UpdatedAtColumn`: The name of the column indicating when a row was last updated.
+- `IDFieldName`: The name of the ID field in the struct.
+- `UpdatedAtFieldName`: The name of the field in the struct indicating when a row was last updated.
 - `ChannelName`: The PostgreSQL LISTEN/NOTIFY channel name for cache invalidation.
 - `CustomPGLN`: Optional custom PGLN instance.
 - `MaxSize`: Maximum number of items to keep in the in-memory cache.
@@ -146,7 +141,7 @@ The `CacheConfig` struct allows you to customize the behavior of the cache:
 ```go
 cache, err := gopgcache.NewCache[User, uuid.UUID](db, config)
 if err != nil {
-    log.Fatalf("Failed to create cache: %v", err)
+log.Fatalf("Failed to create cache: %v", err)
 }
 defer cache.Shutdown()
 ```
@@ -157,11 +152,11 @@ defer cache.Shutdown()
 userID := uuid.New()
 user, exists, err := cache.Get(context.Background(), userID)
 if err != nil {
-    log.Printf("Error retrieving user: %v", err)
+log.Printf("Error retrieving user: %v", err)
 } else if exists {
-    fmt.Printf("User: %+v\n", user)
+fmt.Printf("User: %+v\n", user)
 } else {
-    fmt.Println("User not found")
+fmt.Println("User not found")
 }
 ```
 
@@ -170,7 +165,7 @@ if err != nil {
 ```go
 err := cache.NotifyRemove(userID1, userID2, userID3)
 if err != nil {
-    log.Printf("Error invalidating cache entries: %v", err)
+log.Printf("Error invalidating cache entries: %v", err)
 }
 ```
 

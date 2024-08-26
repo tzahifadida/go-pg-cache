@@ -23,14 +23,6 @@ type TestUser struct {
 	UpdatedAt time.Time `db:"updated_at"`
 }
 
-func (u TestUser) GetID() uuid.UUID {
-	return u.ID
-}
-
-func (u TestUser) GetUpdatedAt() time.Time {
-	return u.UpdatedAt
-}
-
 func startPostgresContainer(ctx context.Context) (testcontainers.Container, *sqlx.DB, error) {
 	req := testcontainers.ContainerRequest{
 		Image:        "postgres:13",
@@ -129,13 +121,13 @@ func TestGoPGCacheWithRealDatabase(t *testing.T) {
 	require.NoError(t, err)
 
 	config := CacheConfig{
-		Schema:          schema,
-		TableName:       table,
-		IDColumn:        "id",
-		UpdatedAtColumn: "updated_at",
-		ChannelName:     "user_cache_updates",
-		MaxSize:         100,
-		Context:         ctx,
+		Schema:             schema,
+		TableName:          table,
+		IDFieldName:        "ID",
+		UpdatedAtFieldName: "UpdatedAt",
+		ChannelName:        "user_cache_updates",
+		MaxSize:            100,
+		Context:            ctx,
 	}
 
 	cache, err := NewCache[TestUser, uuid.UUID](db, config)
@@ -203,13 +195,13 @@ func TestGoPGCacheWithRealDatabase(t *testing.T) {
 	t.Run("CacheEviction", func(t *testing.T) {
 		// Create a new cache with a small size
 		smallCache, err := NewCache[TestUser, uuid.UUID](db, CacheConfig{
-			Schema:          schema,
-			TableName:       table,
-			IDColumn:        "id",
-			UpdatedAtColumn: "updated_at",
-			ChannelName:     "user_cache_updates",
-			MaxSize:         2,
-			Context:         ctx,
+			Schema:             schema,
+			TableName:          table,
+			IDFieldName:        "ID",
+			UpdatedAtFieldName: "UpdatedAt",
+			ChannelName:        "user_cache_updates",
+			MaxSize:            2,
+			Context:            ctx,
 		})
 		require.NoError(t, err)
 		defer smallCache.Shutdown()
@@ -284,13 +276,13 @@ func TestMultipleCachesWithRealDatabase(t *testing.T) {
 	require.NoError(t, err)
 
 	config := CacheConfig{
-		Schema:          schema,
-		TableName:       table,
-		IDColumn:        "id",
-		UpdatedAtColumn: "updated_at",
-		ChannelName:     "user_cache_updates",
-		MaxSize:         100,
-		Context:         ctx,
+		Schema:             schema,
+		TableName:          table,
+		IDFieldName:        "ID",
+		UpdatedAtFieldName: "UpdatedAt",
+		ChannelName:        "user_cache_updates",
+		MaxSize:            100,
+		Context:            ctx,
 	}
 
 	cache1, err := NewCache[TestUser, uuid.UUID](db, config)
@@ -365,13 +357,13 @@ func TestOutOfSyncBehavior(t *testing.T) {
 	require.NoError(t, err)
 
 	config := CacheConfig{
-		Schema:          "public",
-		TableName:       "users",
-		IDColumn:        "id",
-		UpdatedAtColumn: "updated_at",
-		ChannelName:     "user_cache_updates",
-		MaxSize:         100,
-		Context:         ctx,
+		Schema:             "public",
+		TableName:          "users",
+		IDFieldName:        "ID",
+		UpdatedAtFieldName: "UpdatedAt",
+		ChannelName:        "user_cache_updates",
+		MaxSize:            100,
+		Context:            ctx,
 	}
 
 	cache, err := NewCache[TestUser, uuid.UUID](db, config)
@@ -421,13 +413,13 @@ func TestNotifyRemoveMultiple(t *testing.T) {
 	require.NoError(t, err)
 
 	config := CacheConfig{
-		Schema:          "public",
-		TableName:       "users",
-		IDColumn:        "id",
-		UpdatedAtColumn: "updated_at",
-		ChannelName:     "user_cache_updates",
-		MaxSize:         100,
-		Context:         ctx,
+		Schema:             "public",
+		TableName:          "users",
+		IDFieldName:        "ID",
+		UpdatedAtFieldName: "UpdatedAt",
+		ChannelName:        "user_cache_updates",
+		MaxSize:            100,
+		Context:            ctx,
 	}
 
 	cache, err := NewCache[TestUser, uuid.UUID](db, config)
