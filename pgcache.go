@@ -3,6 +3,7 @@ package gopgcache
 import (
 	"container/list"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -66,7 +67,7 @@ type cacheItem[C any, ID comparable] struct {
 type CacheNotification[ID comparable] struct {
 	NodeID uuid.UUID
 	Action string
-	ID     ID
+	IDs    []ID
 }
 
 func NewCache[C CacheableRow[ID], ID comparable](db *sqlx.DB, config CacheConfig) (*Cache[C, ID], error) {
@@ -161,33 +162,41 @@ func getColumnType(db *sqlx.DB, schema, table, column string) (string, error) {
 
 func (c *Cache[C, ID]) Get(ctx context.Context, id ID) (C, bool, error) {
 	c.mutex.RLock()
-	if el, exists := c.cache[id]; exists {
-		c.mutex.RUnlock()
-		c.mutex.Lock()
-		c.lru.MoveToFront(el)
-		c.mutex.Unlock()
-		return el.Value.(cacheItem[C, ID]).value, true, nil
+	outOfSync := c.outOfSync
+	if !outOfSync {
+		if el, exists := c.cache[id]; exists {
+			c.mutex.RUnlock()
+			c.mutex.Lock()
+			c.lru.MoveToFront(el)
+			c.mutex.Unlock()
+			return el.Value.(cacheItem[C, ID]).value, true, nil
+		}
 	}
 	c.mutex.RUnlock()
 
 	row, err := c.loadFromDB(ctx, id)
 	if err != nil {
 		var zero C
+		if err == sql.ErrNoRows {
+			return zero, false, nil
+		}
 		return zero, false, err
 	}
 
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
+	// Always update the cache, even if we were previously out of sync
 	if el, exists := c.cache[id]; exists {
-		return el.Value.(cacheItem[C, ID]).value, true, nil
+		c.lru.MoveToFront(el)
+		el.Value = cacheItem[C, ID]{value: row, id: id}
+	} else {
+		if c.lru.Len() >= c.maxSize {
+			c.evict()
+		}
+		el := c.lru.PushFront(cacheItem[C, ID]{value: row, id: id})
+		c.cache[id] = el
 	}
-
-	if c.lru.Len() >= c.maxSize {
-		c.evict()
-	}
-	el := c.lru.PushFront(cacheItem[C, ID]{value: row, id: id})
-	c.cache[id] = el
 
 	return row, true, nil
 }
@@ -210,18 +219,20 @@ func (c *Cache[C, ID]) evict() {
 	}
 }
 
-func (c *Cache[C, ID]) NotifyRemove(id ID) error {
+func (c *Cache[C, ID]) NotifyRemove(ids ...ID) error {
 	c.mutex.Lock()
-	if el, exists := c.cache[id]; exists {
-		c.lru.Remove(el)
-		delete(c.cache, id)
+	for _, id := range ids {
+		if el, exists := c.cache[id]; exists {
+			c.lru.Remove(el)
+			delete(c.cache, id)
+		}
 	}
 	c.mutex.Unlock()
 
 	notification := CacheNotification[ID]{
 		NodeID: c.nodeID,
 		Action: "remove",
-		ID:     id,
+		IDs:    ids,
 	}
 
 	notificationJSON, err := json.Marshal(notification)
@@ -253,9 +264,11 @@ func (c *Cache[C, ID]) handleNotification(channel string, payload string) {
 
 	if notification.Action == "remove" {
 		c.mutex.Lock()
-		if el, exists := c.cache[notification.ID]; exists {
-			c.lru.Remove(el)
-			delete(c.cache, notification.ID)
+		for _, id := range notification.IDs {
+			if el, exists := c.cache[id]; exists {
+				c.lru.Remove(el)
+				delete(c.cache, id)
+			}
 		}
 		c.mutex.Unlock()
 	}
