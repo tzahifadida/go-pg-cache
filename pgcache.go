@@ -166,6 +166,7 @@ func NewCache[C any, ID comparable](db *sqlx.DB, config CacheConfig) (*Cache[C, 
 
 	return cache, nil
 }
+
 func getColumnType(db *sqlx.DB, schema, table, column string) (string, error) {
 	query := `
 		SELECT data_type 
@@ -185,7 +186,6 @@ func findFields(t reflect.Type, idFieldName, updatedAtFieldName string) (reflect
 	var idTag, updatedAtTag string
 	var ok bool
 
-	// Find the idField by name and get its db tag
 	if idField, ok = t.FieldByName(idFieldName); !ok {
 		return reflect.StructField{}, reflect.StructField{}, "", "", fmt.Errorf("struct does not have a field named %s", idFieldName)
 	}
@@ -194,7 +194,6 @@ func findFields(t reflect.Type, idFieldName, updatedAtFieldName string) (reflect
 		return reflect.StructField{}, reflect.StructField{}, "", "", fmt.Errorf("field %s does not have a 'db' tag", idFieldName)
 	}
 
-	// Find the updatedAtField by name and get its db tag
 	if updatedAtFieldName != "" {
 		if updatedAtField, ok = t.FieldByName(updatedAtFieldName); !ok {
 			return reflect.StructField{}, reflect.StructField{}, "", "", fmt.Errorf("struct does not have a field named %s", updatedAtFieldName)
@@ -208,7 +207,26 @@ func findFields(t reflect.Type, idFieldName, updatedAtFieldName string) (reflect
 	return idField, updatedAtField, idTag, updatedAtTag, nil
 }
 
-func (c *Cache[C, ID]) Get(ctx context.Context, id ID) (C, bool, error) {
+// GetOption represents an option for the Get function
+type GetOption func(*getOptions)
+
+type getOptions struct {
+	cacheOnly bool
+}
+
+// CacheOnly returns a GetOption that instructs Get to only check the cache
+func CacheOnly() GetOption {
+	return func(o *getOptions) {
+		o.cacheOnly = true
+	}
+}
+
+func (c *Cache[C, ID]) Get(ctx context.Context, id ID, opts ...GetOption) (C, bool, error) {
+	options := getOptions{}
+	for _, opt := range opts {
+		opt(&options)
+	}
+
 	c.mutex.RLock()
 	outOfSync := c.outOfSync
 	if !outOfSync {
@@ -221,6 +239,11 @@ func (c *Cache[C, ID]) Get(ctx context.Context, id ID) (C, bool, error) {
 		}
 	}
 	c.mutex.RUnlock()
+
+	if options.cacheOnly {
+		var zero C
+		return zero, false, nil
+	}
 
 	row, err := c.loadFromDB(ctx, id)
 	if err != nil {
@@ -271,6 +294,25 @@ func (c *Cache[C, ID]) evict() {
 }
 
 func (c *Cache[C, ID]) NotifyRemove(ids ...ID) error {
+	notifyQueryResult, err := c.NotifyRemoveAndGetQuery(ids...)
+	if err != nil {
+		return fmt.Errorf("failed to get notify query: %w", err)
+	}
+
+	_, err = c.db.ExecContext(c.ctx, notifyQueryResult.Query, notifyQueryResult.Params...)
+	if err != nil {
+		return fmt.Errorf("failed to execute notify query: %w", err)
+	}
+
+	return nil
+}
+
+type NotifyQueryResult struct {
+	Query  string
+	Params []interface{}
+}
+
+func (c *Cache[C, ID]) NotifyRemoveAndGetQuery(ids ...ID) (NotifyQueryResult, error) {
 	c.mutex.Lock()
 	for _, id := range ids {
 		if el, exists := c.cache[id]; exists {
@@ -288,16 +330,31 @@ func (c *Cache[C, ID]) NotifyRemove(ids ...ID) error {
 
 	notificationJSON, err := json.Marshal(notification)
 	if err != nil {
-		return fmt.Errorf("failed to marshal notification: %w", err)
+		return NotifyQueryResult{}, fmt.Errorf("failed to marshal notification: %w", err)
 	}
 
-	notifyQuery := c.pgln.NotifyQuery(c.channelName, string(notificationJSON))
-	_, err = c.db.ExecContext(c.ctx, notifyQuery.Query, notifyQuery.Params...)
-	if err != nil {
-		return fmt.Errorf("failed to send notification: %w", err)
-	}
+	pglnResult := c.pgln.NotifyQuery(c.channelName, string(notificationJSON))
 
-	return nil
+	return NotifyQueryResult{
+		Query:  pglnResult.Query,
+		Params: pglnResult.Params,
+	}, nil
+}
+
+func (c *Cache[C, ID]) Put(ctx context.Context, id ID, row C) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	if el, exists := c.cache[id]; exists {
+		c.lru.MoveToFront(el)
+		el.Value = cacheItem[C, ID]{value: row, id: id}
+	} else {
+		if c.lru.Len() >= c.maxSize {
+			c.evict()
+		}
+		el := c.lru.PushFront(cacheItem[C, ID]{value: row, id: id})
+		c.cache[id] = el
+	}
 }
 
 func (c *Cache[C, ID]) handleNotification(channel string, payload string) {
@@ -306,10 +363,6 @@ func (c *Cache[C, ID]) handleNotification(channel string, payload string) {
 	err := json.Unmarshal([]byte(payload), &notification)
 	if err != nil {
 		c.logger.Error("Error unmarshalling notification: %v\n", err)
-		return
-	}
-
-	if notification.NodeID == c.nodeID {
 		return
 	}
 
@@ -364,12 +417,12 @@ func (c *Cache[C, ID]) refreshCache(ctx context.Context) error {
 		)
 		SELECT existing.id FROM existing
 		LEFT JOIN "%s"."%s" t ON existing.id = t."%s"
-		WHERE t."%s" IS NULL
-		UNION
-		SELECT t."%s" FROM "%s"."%s" t
-		JOIN existing ON t."%s" = existing.id
-		WHERE t."%s" > $%d
-	`, placeholders,
+                                                 		WHERE t."%s" IS NULL
+                                                 		UNION
+                                                 		SELECT t."%s" FROM "%s"."%s" t
+                                                 		JOIN existing ON t."%s" = existing.id
+                                                 		WHERE t."%s" > $%d
+                                                 	`, placeholders,
 		c.schema, c.tableName, c.idColumnName,
 		c.idColumnName,
 		c.idColumnName, c.schema, c.tableName,

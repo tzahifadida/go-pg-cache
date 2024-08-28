@@ -259,6 +259,89 @@ func TestGoPGCacheWithRealDatabase(t *testing.T) {
 		assert.True(t, exists)
 		assert.Equal(t, "Refreshed User", refreshedUser.Name)
 	})
+
+	// New test for NotifyRemoveAndGetQuery
+	t.Run("NotifyRemoveAndGetQuery", func(t *testing.T) {
+		userID := uuid.New()
+		_, err := db.ExecContext(ctx, fmt.Sprintf(`INSERT INTO "%s"."%s" (id, name) VALUES ($1, $2)`, schema, table), userID, "Test User")
+		require.NoError(t, err)
+
+		// Retrieve the user to cache it
+		user, exists, err := cache.Get(ctx, userID)
+		require.NoError(t, err)
+		assert.True(t, exists)
+		assert.Equal(t, "Test User", user.Name)
+
+		// Get the notify query
+		notifyQueryResult, err := cache.NotifyRemoveAndGetQuery(userID)
+		require.NoError(t, err)
+
+		// Execute the notify query
+		tx, err := db.BeginTx(ctx, nil)
+		require.NoError(t, err)
+
+		_, err = tx.ExecContext(ctx, notifyQueryResult.Query, notifyQueryResult.Params...)
+		require.NoError(t, err)
+
+		err = tx.Commit()
+		require.NoError(t, err)
+
+		time.Sleep(100 * time.Millisecond)
+		// Check that the user is removed from the cache
+		cache.mutex.RLock()
+		_, exists = cache.cache[userID]
+		cache.mutex.RUnlock()
+		assert.False(t, exists)
+	})
+
+	// New test for Put
+	t.Run("Put", func(t *testing.T) {
+		userID := uuid.New()
+		user := TestUser{
+			ID:        userID,
+			Name:      "Put Test User",
+			UpdatedAt: time.Now(),
+		}
+
+		// Put the user in the cache
+		cache.Put(ctx, userID, user)
+
+		// Retrieve the user from the cache
+		cachedUser, exists, err := cache.Get(ctx, userID, CacheOnly())
+		require.NoError(t, err)
+		assert.True(t, exists)
+		assert.Equal(t, user, cachedUser)
+
+		// Verify the user is not in the database
+		var dbUser TestUser
+		err = db.GetContext(ctx, &dbUser, fmt.Sprintf(`SELECT * FROM "%s"."%s" WHERE id = $1`, schema, table), userID)
+		assert.Error(t, err) // Expect an error because the user should not be in the database
+	})
+
+	// New test for Get with CacheOnly option
+	t.Run("GetCacheOnly", func(t *testing.T) {
+		userID := uuid.New()
+		_, err := db.ExecContext(ctx, fmt.Sprintf(`INSERT INTO "%s"."%s" (id, name) VALUES ($1, $2)`, schema, table), userID, "Cache Only Test")
+		require.NoError(t, err)
+
+		// Try to get the user with CacheOnly (should not exist in cache)
+		user, exists, err := cache.Get(ctx, userID, CacheOnly())
+		require.NoError(t, err)
+		assert.False(t, exists)
+		assert.Equal(t, TestUser{}, user)
+
+		// Get the user normally (should load from DB and cache it)
+		user, exists, err = cache.Get(ctx, userID)
+		require.NoError(t, err)
+		assert.True(t, exists)
+		assert.Equal(t, "Cache Only Test", user.Name)
+
+		// Now try CacheOnly again (should exist in cache)
+		cachedUser, exists, err := cache.Get(ctx, userID, CacheOnly())
+		require.NoError(t, err)
+		assert.True(t, exists)
+		assert.Equal(t, user, cachedUser)
+	})
 }
 
 func TestMultipleCachesWithRealDatabase(t *testing.T) {
@@ -342,6 +425,49 @@ func TestMultipleCachesWithRealDatabase(t *testing.T) {
 		require.NoError(t, err)
 		assert.True(t, exists)
 		assert.Equal(t, "Updated Multi Cache", updatedUser2.Name)
+	})
+
+	// New test for Put and Get with CacheOnly across multiple caches
+	t.Run("PutAndGetCacheOnlyAcrossMultipleCaches", func(t *testing.T) {
+		userID := uuid.New()
+		user := TestUser{
+			ID:        userID,
+			Name:      "Multi Cache Put Test",
+			UpdatedAt: time.Now(),
+		}
+
+		// Put the user in cache1
+		cache1.Put(ctx, userID, user)
+
+		// Try to get the user from cache2 with CacheOnly (should not exist)
+		cachedUser, exists, err := cache2.Get(ctx, userID, CacheOnly())
+		require.NoError(t, err)
+		assert.False(t, exists)
+		assert.Equal(t, TestUser{}, cachedUser)
+
+		// Get the user from cache1 with CacheOnly (should exist)
+		cachedUser, exists, err = cache1.Get(ctx, userID, CacheOnly())
+		require.NoError(t, err)
+		assert.True(t, exists)
+		assert.Equal(t, user, cachedUser)
+
+		// Notify remove from cache1
+		err = cache1.NotifyRemove(userID)
+		require.NoError(t, err)
+
+		// Wait a bit for the notification to propagate
+		time.Sleep(100 * time.Millisecond)
+
+		// Try to get the user from both caches with CacheOnly (should not exist in either)
+		cachedUser, exists, err = cache1.Get(ctx, userID, CacheOnly())
+		require.NoError(t, err)
+		assert.False(t, exists)
+		assert.Equal(t, TestUser{}, cachedUser)
+
+		cachedUser, exists, err = cache2.Get(ctx, userID, CacheOnly())
+		require.NoError(t, err)
+		assert.False(t, exists)
+		assert.Equal(t, TestUser{}, cachedUser)
 	})
 }
 
@@ -446,6 +572,82 @@ func TestNotifyRemoveMultiple(t *testing.T) {
 		err = cache.NotifyRemove(userIDs...)
 		require.NoError(t, err)
 
+		time.Sleep(100 * time.Millisecond)
+		// Check that all users are removed from the cache
+		for _, id := range userIDs {
+			cache.mutex.RLock()
+			_, exists := cache.cache[id]
+			cache.mutex.RUnlock()
+			assert.False(t, exists)
+		}
+
+		// Retrieve users again (should fetch from DB)
+		for i, id := range userIDs {
+			user, exists, err := cache.Get(ctx, id)
+			require.NoError(t, err)
+			assert.True(t, exists)
+			assert.Equal(t, fmt.Sprintf("User %d", i+1), user.Name)
+		}
+	})
+}
+
+// New test for NotifyRemoveAndGetQuery with multiple IDs
+func TestNotifyRemoveAndGetQueryMultiple(t *testing.T) {
+	ctx := context.Background()
+
+	postgres, db, err := startPostgresContainer(ctx)
+	require.NoError(t, err)
+	defer postgres.Terminate(ctx)
+	defer db.Close()
+
+	err = setupTestTable(db, "public", "users")
+	require.NoError(t, err)
+
+	config := CacheConfig{
+		Schema:             "public",
+		TableName:          "users",
+		IDFieldName:        "ID",
+		UpdatedAtFieldName: "UpdatedAt",
+		ChannelName:        "user_cache_updates",
+		MaxSize:            100,
+		Context:            ctx,
+	}
+
+	cache, err := NewCache[TestUser, uuid.UUID](db, config)
+	require.NoError(t, err)
+	defer cache.Shutdown()
+
+	t.Run("NotifyRemoveAndGetQueryMultipleIDs", func(t *testing.T) {
+		// Insert multiple users
+		userIDs := make([]uuid.UUID, 3)
+		for i := 0; i < 3; i++ {
+			userIDs[i] = uuid.New()
+			_, err := db.ExecContext(ctx, `INSERT INTO "public"."users" (id, name) VALUES ($1, $2)`, userIDs[i], fmt.Sprintf("User %d", i+1))
+			require.NoError(t, err)
+		}
+
+		// Retrieve all users to cache them
+		for _, id := range userIDs {
+			_, exists, err := cache.Get(ctx, id)
+			require.NoError(t, err)
+			assert.True(t, exists)
+		}
+
+		// Get the notify query for multiple users
+		notifyQueryResult, err := cache.NotifyRemoveAndGetQuery(userIDs...)
+		require.NoError(t, err)
+
+		// Execute the notify query
+		tx, err := db.BeginTx(ctx, nil)
+		require.NoError(t, err)
+
+		_, err = tx.ExecContext(ctx, notifyQueryResult.Query, notifyQueryResult.Params...)
+		require.NoError(t, err)
+
+		err = tx.Commit()
+		require.NoError(t, err)
+
+		time.Sleep(100 * time.Millisecond)
 		// Check that all users are removed from the cache
 		for _, id := range userIDs {
 			cache.mutex.RLock()

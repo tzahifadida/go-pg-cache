@@ -55,8 +55,7 @@ performance.
 - **Selective Caching**: Designed to cache a limited, frequently accessed subset of your PostgreSQL table.
 - **Distributed Caching**: Uses PostgreSQL LISTEN/NOTIFY for real-time cache invalidation across nodes, ensuring
   consistency in distributed environments.
-- **Generic Implementation**: Supports caching of any struct that implements the `CacheableRow` interface, allowing
-  flexibility in what data is cached.
+- **Generic Implementation**: Supports caching of any struct type, allowing flexibility in what data is cached.
 - **UUID Support**: Uses UUIDs as the primary key type for enhanced uniqueness and compatibility with modern application
   designs.
 - **Bulk Invalidation**: Supports invalidating multiple cache entries at once, useful for related data updates.
@@ -69,6 +68,9 @@ performance.
 - **Automatic Synchronization**: Handles out-of-sync scenarios gracefully, ensuring cache consistency even after network
   issues or application restarts.
 - **Logging**: Integrated logging for easier debugging and monitoring of cache operations.
+- **Cache-Only Retrieval**: Option to retrieve data only from the cache without hitting the database.
+- **Direct Cache Manipulation**: Ability to directly add or update items in the cache.
+- **Transactional Notifications**: Support for getting notification queries for use within transactions.
 
 ## Installation
 
@@ -95,43 +97,42 @@ import (
 
 // Define your struct
 type User struct {
-    ID        uuid.UUID `db:"id"`
-    Name      string    `db:"name"`
-    UpdatedAt time.Time `db:"updated_at"`
+ID        uuid.UUID `db:"id"`
+Name      string    `db:"name"`
+UpdatedAt time.Time `db:"updated_at"`
 }
 
 // Initialize the cache
 db, _ := sqlx.Connect("pgx", "your_connection_string")
 config := gopgcache.CacheConfig{
-    Schema:          "public",
-    TableName:       "users",
-    IDFieldName:     "ID",
-    UpdatedAtFieldName: "UpdatedAt",
-    ChannelName:     "cache_invalidation",
-    MaxSize:         1000,
-    Context:         context.Background(),
+Schema:             "public",
+TableName:          "users",
+IDFieldName:        "ID",
+UpdatedAtFieldName: "UpdatedAt",
+ChannelName:        "cache_invalidation",
+MaxSize:            1000,
+Context:            context.Background(),
 }
 
 cache, err := gopgcache.NewCache[User, uuid.UUID](db, config)
 if err != nil {
-    log.Fatalf("Failed to create cache: %v", err)
+log.Fatalf("Failed to create cache: %v", err)
 }
 
 // Use the cache
 userID := uuid.New()
 user, exists, err := cache.Get(context.Background(), userID)
 if err != nil {
-    log.Printf("Error getting user: %v", err)
+log.Printf("Error getting user: %v", err)
 } else if exists {
-    fmt.Printf("User: %v\n", user)
+fmt.Printf("User: %v\n", user)
 }
 
 // Invalidate cache entries
 err = cache.NotifyRemove(userID, uuid.New(), uuid.New())
 if err != nil {
-    log.Printf("Error notifying removal: %v", err)
+log.Printf("Error notifying removal: %v", err)
 }
-
 ```
 
 ## Configuration
@@ -155,7 +156,7 @@ The `CacheConfig` struct allows you to customize the behavior of the cache:
 ```go
 cache, err := gopgcache.NewCache[User, uuid.UUID](db, config)
 if err != nil {
-    log.Fatalf("Failed to create cache: %v", err)
+log.Fatalf("Failed to create cache: %v", err)
 }
 defer cache.Shutdown()
 ```
@@ -166,11 +167,24 @@ defer cache.Shutdown()
 userID := uuid.New()
 user, exists, err := cache.Get(context.Background(), userID)
 if err != nil {
-    log.Printf("Error retrieving user: %v", err)
+log.Printf("Error retrieving user: %v", err)
 } else if exists {
-    fmt.Printf("User: %+v\n", user)
+fmt.Printf("User: %+v\n", user)
 } else {
-    fmt.Println("User not found")
+fmt.Println("User not found")
+}
+```
+
+### Retrieving an Item (Cache-Only)
+
+```go
+user, exists, err := cache.Get(context.Background(), userID, gopgcache.CacheOnly())
+if err != nil {
+log.Printf("Error retrieving user: %v", err)
+} else if exists {
+fmt.Printf("User (from cache): %+v\n", user)
+} else {
+fmt.Println("User not found in cache")
 }
 ```
 
@@ -179,7 +193,80 @@ if err != nil {
 ```go
 err := cache.NotifyRemove(userID1, userID2, userID3)
 if err != nil {
-    log.Printf("Error invalidating cache entries: %v", err)
+log.Printf("Error invalidating cache entries: %v", err)
+}
+```
+
+### Invalidating Cache Entries in a Transaction
+
+```go
+notifyQueryResult, err := cache.NotifyRemoveAndGetQuery(userID1, userID2, userID3)
+if err != nil {
+log.Printf("Error getting notify query: %v", err)
+return
+}
+
+tx, err := db.BeginTx(context.Background(), nil)
+if err != nil {
+log.Printf("Error starting transaction: %v", err)
+return
+}
+
+_, err = tx.ExecContext(context.Background(), notifyQueryResult.Query, notifyQueryResult.Params...)
+if err != nil {
+tx.Rollback()
+log.Printf("Error executing notify query: %v", err)
+return
+}
+
+err = tx.Commit()
+if err != nil {
+log.Printf("Error committing transaction: %v", err)
+return
+}
+```
+
+### Directly Adding or Updating an Item in Cache
+
+```go
+user := User{
+ID:   uuid.New(),
+Name: "John Doe",
+UpdatedAt: time.Now(),
+}
+cache.Put(context.Background(), user.ID, user)
+```
+
+### Using NotifyRemoveAndGetQuery for Flexible Cache Invalidation
+
+```go
+// Get the notify query for cache invalidation
+notifyQueryResult, err := cache.NotifyRemoveAndGetQuery(userID1, userID2, userID3)
+if err != nil {
+    log.Printf("Error getting notify query: %v", err)
+    return
+}
+
+// Use the query in a transaction or any other context
+tx, err := db.BeginTx(context.Background(), nil)
+if err != nil {
+    log.Printf("Error starting transaction: %v", err)
+    return
+}
+
+// Execute the notify query
+_, err = tx.ExecContext(context.Background(), notifyQueryResult.Query, notifyQueryResult.Params...)
+if err != nil {
+    tx.Rollback()
+    log.Printf("Error executing notify query: %v", err)
+    return
+}
+
+// Commit the transaction
+err = tx.Commit()
+if err != nil {
+    log.Printf("Error committing transaction: %v", err)
+    return
 }
 ```
 
@@ -197,6 +284,8 @@ if err != nil {
   cache is providing the expected performance benefits.
 - **Data Access Patterns**: Regularly analyze your data access patterns to ensure you're caching the most frequently
   accessed subset of your data.
+- **Use of Cache-Only Retrieval**: Utilize the `CacheOnly()` option when you want to avoid database hits for non-critical data retrieval.
+- **Transactional Notifications**: Use `NotifyRemoveAndGetQuery` when you need to ensure cache invalidation occurs only if a transaction is successfully committed.
 
 ## Contributing
 
