@@ -665,3 +665,97 @@ func TestNotifyRemoveAndGetQueryMultiple(t *testing.T) {
 		}
 	})
 }
+
+func TestClearAllAndNotify(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	postgres, db, err := startPostgresContainer(ctx)
+	require.NoError(t, err)
+	defer postgres.Terminate(ctx)
+	defer db.Close()
+
+	schema := "test_schema"
+	table := "users"
+	err = setupTestTable(db, schema, table)
+	require.NoError(t, err)
+
+	config := CacheConfig{
+		Schema:             schema,
+		TableName:          table,
+		IDFieldName:        "ID",
+		UpdatedAtFieldName: "UpdatedAt",
+		ChannelName:        "user_cache_updates",
+		MaxSize:            100,
+		Context:            ctx,
+	}
+
+	cache1, err := NewCache[TestUser, uuid.UUID](db, config)
+	require.NoError(t, err)
+	defer cache1.Shutdown()
+
+	cache2, err := NewCache[TestUser, uuid.UUID](db, config)
+	require.NoError(t, err)
+	defer cache2.Shutdown()
+
+	// Insert test users
+	testUsers := make([]TestUser, 3)
+	for i := 0; i < 3; i++ {
+		user := TestUser{
+			ID:   uuid.New(),
+			Name: fmt.Sprintf("User %d", i+1),
+		}
+		testUsers[i] = user
+		_, err := db.ExecContext(ctx, fmt.Sprintf(`INSERT INTO "%s"."%s" (id, name) VALUES ($1, $2)`, schema, table), user.ID, user.Name)
+		require.NoError(t, err)
+	}
+
+	// Load users into both caches
+	for _, user := range testUsers {
+		_, exists, err := cache1.Get(ctx, user.ID)
+		require.NoError(t, err)
+		assert.True(t, exists)
+
+		_, exists, err = cache2.Get(ctx, user.ID)
+		require.NoError(t, err)
+		assert.True(t, exists)
+	}
+
+	// Verify that users are in both caches
+	for _, user := range testUsers {
+		_, exists, _ := cache1.Get(ctx, user.ID, CacheOnly())
+		assert.True(t, exists, "User should be in cache1")
+
+		_, exists, _ = cache2.Get(ctx, user.ID, CacheOnly())
+		assert.True(t, exists, "User should be in cache2")
+	}
+
+	// Call ClearAllAndNotify on cache1
+	err = cache1.ClearAllAndNotify(ctx)
+	require.NoError(t, err)
+
+	// Wait a bit for the notification to propagate
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify that both caches are cleared
+	for _, user := range testUsers {
+		_, exists, _ := cache1.Get(ctx, user.ID, CacheOnly())
+		assert.False(t, exists, "User should not be in cache1 after ClearAllAndNotify")
+
+		_, exists, _ = cache2.Get(ctx, user.ID, CacheOnly())
+		assert.False(t, exists, "User should not be in cache2 after ClearAllAndNotify")
+	}
+
+	// Verify that we can still retrieve users from the database
+	for _, user := range testUsers {
+		retrievedUser, exists, err := cache1.Get(ctx, user.ID)
+		require.NoError(t, err)
+		assert.True(t, exists)
+		assert.Equal(t, user.Name, retrievedUser.Name)
+
+		retrievedUser, exists, err = cache2.Get(ctx, user.ID)
+		require.NoError(t, err)
+		assert.True(t, exists)
+		assert.Equal(t, user.Name, retrievedUser.Name)
+	}
+}

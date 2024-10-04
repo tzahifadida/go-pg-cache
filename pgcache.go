@@ -152,7 +152,7 @@ func NewCache[C any, ID comparable](db *sqlx.DB, config CacheConfig) (*Cache[C, 
 	err = pglnInstance.ListenAndWaitForListening(config.ChannelName, pgln.ListenOptions{
 		NotificationCallback: cache.handleNotification,
 		ErrorCallback: func(channel string, err error) {
-			cache.logger.Error("PGLN error on channel %s: %v\n", channel, err)
+			cache.logger.Error("PGLN error on channel %s: %v", channel, err)
 			cache.mutex.Lock()
 			cache.outOfSync = true
 			cache.mutex.Unlock()
@@ -207,14 +207,12 @@ func findFields(t reflect.Type, idFieldName, updatedAtFieldName string) (reflect
 	return idField, updatedAtField, idTag, updatedAtTag, nil
 }
 
-// GetOption represents an option for the Get function
 type GetOption func(*getOptions)
 
 type getOptions struct {
 	cacheOnly bool
 }
 
-// CacheOnly returns a GetOption that instructs Get to only check the cache
 func CacheOnly() GetOption {
 	return func(o *getOptions) {
 		o.cacheOnly = true
@@ -362,7 +360,7 @@ func (c *Cache[C, ID]) handleNotification(channel string, payload string) {
 
 	err := json.Unmarshal([]byte(payload), &notification)
 	if err != nil {
-		c.logger.Error("Error unmarshalling notification: %v\n", err)
+		c.logger.Error("Error unmarshalling notification: %v", err)
 		return
 	}
 
@@ -375,6 +373,11 @@ func (c *Cache[C, ID]) handleNotification(channel string, payload string) {
 			}
 		}
 		c.mutex.Unlock()
+	} else if notification.Action == "clear_all" {
+		c.ClearCache()
+		c.logger.Debug("Cleared entire cache due to clear_all notification")
+	} else {
+		c.logger.Error("Unsupported notification action: %v", notification.Action)
 	}
 }
 
@@ -417,12 +420,12 @@ func (c *Cache[C, ID]) refreshCache(ctx context.Context) error {
 		)
 		SELECT existing.id FROM existing
 		LEFT JOIN "%s"."%s" t ON existing.id = t."%s"
-                                                 		WHERE t."%s" IS NULL
-                                                 		UNION
-                                                 		SELECT t."%s" FROM "%s"."%s" t
-                                                 		JOIN existing ON t."%s" = existing.id
-                                                 		WHERE t."%s" > $%d
-                                                 	`, placeholders,
+		WHERE t."%s" IS NULL
+		UNION
+		SELECT t."%s" FROM "%s"."%s" t
+		JOIN existing ON t."%s" = existing.id
+        WHERE t."%s" > $%d
+	`, placeholders,
 		c.schema, c.tableName, c.idColumnName,
 		c.idColumnName,
 		c.idColumnName, c.schema, c.tableName,
@@ -481,4 +484,30 @@ func (c *Cache[C, ID]) Shutdown() {
 	if !c.customPGLN {
 		c.pgln.Shutdown()
 	}
+}
+
+// ClearAllAndNotify clears the entire local cache and sends a notification to all nodes to clear their caches
+func (c *Cache[C, ID]) ClearAllAndNotify(ctx context.Context) error {
+	// Clear the local cache
+	c.ClearCache()
+
+	// Prepare the notification
+	notification := CacheNotification[ID]{
+		NodeID: c.nodeID,
+		Action: "clear_all",
+		IDs:    nil, // No specific IDs, as we're clearing everything
+	}
+
+	notificationJSON, err := json.Marshal(notification)
+	if err != nil {
+		return fmt.Errorf("failed to marshal clear all notification: %w", err)
+	}
+	pglnResult := c.pgln.NotifyQuery(c.channelName, string(notificationJSON))
+	// Send the notification
+	_, err = c.db.ExecContext(ctx, pglnResult.Query, pglnResult.Params...)
+	if err != nil {
+		return fmt.Errorf("failed to send clear all notification: %w", err)
+	}
+
+	return nil
 }

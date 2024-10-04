@@ -71,6 +71,7 @@ performance.
 - **Cache-Only Retrieval**: Option to retrieve data only from the cache without hitting the database.
 - **Direct Cache Manipulation**: Ability to directly add or update items in the cache.
 - **Transactional Notifications**: Support for getting notification queries for use within transactions.
+- **Global Cache Clearing**: New `ClearAllAndNotify` method to clear all caches across all nodes simultaneously.
 
 ## Installation
 
@@ -86,52 +87,58 @@ Here's a basic example of how to use `go-pg-cache`:
 
 ```go
 import (
-"github.com/tzahifadida/go-pg-cache"
-"github.com/jmoiron/sqlx"
-"github.com/google/uuid"
-"context"
-"log"
-"time"
-"fmt"
+    "github.com/tzahifadida/go-pg-cache"
+    "github.com/jmoiron/sqlx"
+    "github.com/google/uuid"
+    "context"
+    "log"
+    "time"
+    "fmt"
 )
 
 // Define your struct
 type User struct {
-ID        uuid.UUID `db:"id"`
-Name      string    `db:"name"`
-UpdatedAt time.Time `db:"updated_at"`
+    ID        uuid.UUID `db:"id"`
+    Name      string    `db:"name"`
+    UpdatedAt time.Time `db:"updated_at"`
 }
 
 // Initialize the cache
 db, _ := sqlx.Connect("pgx", "your_connection_string")
 config := gopgcache.CacheConfig{
-Schema:             "public",
-TableName:          "users",
-IDFieldName:        "ID",
-UpdatedAtFieldName: "UpdatedAt",
-ChannelName:        "cache_invalidation",
-MaxSize:            1000,
-Context:            context.Background(),
+    Schema:             "public",
+    TableName:          "users",
+    IDFieldName:        "ID",
+    UpdatedAtFieldName: "UpdatedAt",
+    ChannelName:        "cache_invalidation",
+    MaxSize:            1000,
+    Context:            context.Background(),
 }
 
 cache, err := gopgcache.NewCache[User, uuid.UUID](db, config)
 if err != nil {
-log.Fatalf("Failed to create cache: %v", err)
+    log.Fatalf("Failed to create cache: %v", err)
 }
 
 // Use the cache
 userID := uuid.New()
 user, exists, err := cache.Get(context.Background(), userID)
 if err != nil {
-log.Printf("Error getting user: %v", err)
+    log.Printf("Error getting user: %v", err)
 } else if exists {
-fmt.Printf("User: %v\n", user)
+    fmt.Printf("User: %v\n", user)
 }
 
 // Invalidate cache entries
 err = cache.NotifyRemove(userID, uuid.New(), uuid.New())
 if err != nil {
-log.Printf("Error notifying removal: %v", err)
+    log.Printf("Error notifying removal: %v", err)
+}
+
+// Clear all caches across all nodes
+err = cache.ClearAllAndNotify(context.Background())
+if err != nil {
+    log.Printf("Error clearing all caches: %v", err)
 }
 ```
 
@@ -156,7 +163,7 @@ The `CacheConfig` struct allows you to customize the behavior of the cache:
 ```go
 cache, err := gopgcache.NewCache[User, uuid.UUID](db, config)
 if err != nil {
-log.Fatalf("Failed to create cache: %v", err)
+    log.Fatalf("Failed to create cache: %v", err)
 }
 defer cache.Shutdown()
 ```
@@ -167,11 +174,11 @@ defer cache.Shutdown()
 userID := uuid.New()
 user, exists, err := cache.Get(context.Background(), userID)
 if err != nil {
-log.Printf("Error retrieving user: %v", err)
+    log.Printf("Error retrieving user: %v", err)
 } else if exists {
-fmt.Printf("User: %+v\n", user)
+    fmt.Printf("User: %+v\n", user)
 } else {
-fmt.Println("User not found")
+    fmt.Println("User not found")
 }
 ```
 
@@ -180,11 +187,11 @@ fmt.Println("User not found")
 ```go
 user, exists, err := cache.Get(context.Background(), userID, gopgcache.CacheOnly())
 if err != nil {
-log.Printf("Error retrieving user: %v", err)
+    log.Printf("Error retrieving user: %v", err)
 } else if exists {
-fmt.Printf("User (from cache): %+v\n", user)
+    fmt.Printf("User (from cache): %+v\n", user)
 } else {
-fmt.Println("User not found in cache")
+    fmt.Println("User not found in cache")
 }
 ```
 
@@ -193,7 +200,7 @@ fmt.Println("User not found in cache")
 ```go
 err := cache.NotifyRemove(userID1, userID2, userID3)
 if err != nil {
-log.Printf("Error invalidating cache entries: %v", err)
+    log.Printf("Error invalidating cache entries: %v", err)
 }
 ```
 
@@ -202,27 +209,27 @@ log.Printf("Error invalidating cache entries: %v", err)
 ```go
 notifyQueryResult, err := cache.NotifyRemoveAndGetQuery(userID1, userID2, userID3)
 if err != nil {
-log.Printf("Error getting notify query: %v", err)
-return
+    log.Printf("Error getting notify query: %v", err)
+    return
 }
 
 tx, err := db.BeginTx(context.Background(), nil)
 if err != nil {
-log.Printf("Error starting transaction: %v", err)
-return
+    log.Printf("Error starting transaction: %v", err)
+    return
 }
 
 _, err = tx.ExecContext(context.Background(), notifyQueryResult.Query, notifyQueryResult.Params...)
 if err != nil {
-tx.Rollback()
-log.Printf("Error executing notify query: %v", err)
-return
+    tx.Rollback()
+    log.Printf("Error executing notify query: %v", err)
+    return
 }
 
 err = tx.Commit()
 if err != nil {
-log.Printf("Error committing transaction: %v", err)
-return
+    log.Printf("Error committing transaction: %v", err)
+    return
 }
 ```
 
@@ -230,11 +237,20 @@ return
 
 ```go
 user := User{
-ID:   uuid.New(),
-Name: "John Doe",
-UpdatedAt: time.Now(),
+    ID:   uuid.New(),
+    Name: "John Doe",
+    UpdatedAt: time.Now(),
 }
 cache.Put(context.Background(), user.ID, user)
+```
+
+### Clearing All Caches Across All Nodes
+
+```go
+err := cache.ClearAllAndNotify(context.Background())
+if err != nil {
+    log.Printf("Error clearing all caches: %v", err)
+}
 ```
 
 ### Using NotifyRemoveAndGetQuery for Flexible Cache Invalidation
@@ -270,6 +286,7 @@ if err != nil {
 }
 ```
 
+
 ## Performance Considerations
 
 - **Cache Size**: Adjust the `MaxSize` in `CacheConfig` based on your application's memory constraints and the size of
@@ -286,6 +303,7 @@ if err != nil {
   accessed subset of your data.
 - **Use of Cache-Only Retrieval**: Utilize the `CacheOnly()` option when you want to avoid database hits for non-critical data retrieval.
 - **Transactional Notifications**: Use `NotifyRemoveAndGetQuery` when you need to ensure cache invalidation occurs only if a transaction is successfully committed.
+- **Global Cache Clearing**: Use `ClearAllAndNotify` sparingly, as it impacts all nodes and can temporarily increase database load as caches are repopulated.
 
 ## Contributing
 
