@@ -759,3 +759,202 @@ func TestClearAllAndNotify(t *testing.T) {
 		assert.Equal(t, user.Name, retrievedUser.Name)
 	}
 }
+
+type TestUserWithPointer struct {
+	ID        uuid.UUID  `db:"id"`
+	Name      string     `db:"name"`
+	UpdatedAt *time.Time `db:"updated_at"` // This is the key - nullable timestamp = pointer
+}
+
+func setupTestTableWithNullableTimestamp(db *sqlx.DB, schema, table string) error {
+	_, err := db.Exec(fmt.Sprintf(`
+		CREATE SCHEMA IF NOT EXISTS "%s";
+		CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+		CREATE TABLE "%s"."%s" (
+			id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+			name TEXT NOT NULL,
+			updated_at TIMESTAMP WITH TIME ZONE NULL  -- NULL-able timestamp
+		)
+	`, schema, schema, table))
+	return err
+}
+
+func TestTimePointerPanicReproduction(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	postgres, db, err := startPostgresContainer(ctx)
+	require.NoError(t, err)
+	defer postgres.Terminate(ctx)
+	defer db.Close()
+
+	schema := "test_schema"
+	table := "users_with_nullable_timestamp"
+	err = setupTestTableWithNullableTimestamp(db, schema, table)
+	require.NoError(t, err)
+
+	config := CacheConfig{
+		Schema:             schema,
+		TableName:          table,
+		IDFieldName:        "ID",
+		UpdatedAtFieldName: "UpdatedAt",
+		ChannelName:        "nullable_timestamp_cache",
+		MaxSize:            100,
+		Context:            ctx,
+	}
+
+	cache, err := NewCache[TestUserWithPointer, uuid.UUID](db, config)
+	require.NoError(t, err)
+	defer cache.Shutdown()
+
+	t.Run("PanicWithNullableTimestamp", func(t *testing.T) {
+		// Insert users with mix of NULL and non-NULL timestamps
+		userID1 := uuid.New()
+		userID2 := uuid.New()
+		userID3 := uuid.New()
+
+		// User with NULL updated_at (this becomes *time.Time = nil in Go)
+		_, err := db.ExecContext(ctx, fmt.Sprintf(`INSERT INTO "%s"."%s" (id, name, updated_at) VALUES ($1, $2, NULL)`, schema, table),
+			userID1, "User with NULL timestamp")
+		require.NoError(t, err)
+
+		// User with actual timestamp
+		_, err = db.ExecContext(ctx, fmt.Sprintf(`INSERT INTO "%s"."%s" (id, name, updated_at) VALUES ($1, $2, NOW())`, schema, table),
+			userID2, "User with timestamp")
+		require.NoError(t, err)
+
+		// Another user with NULL timestamp
+		_, err = db.ExecContext(ctx, fmt.Sprintf(`INSERT INTO "%s"."%s" (id, name, updated_at) VALUES ($1, $2, NULL)`, schema, table),
+			userID3, "Another user with NULL")
+		require.NoError(t, err)
+
+		// Load users into cache
+		user1, exists, err := cache.Get(ctx, userID1)
+		require.NoError(t, err)
+		require.True(t, exists)
+		assert.Nil(t, user1.UpdatedAt) // This should be nil from NULL database value
+
+		user2, exists, err := cache.Get(ctx, userID2)
+		require.NoError(t, err)
+		require.True(t, exists)
+		assert.NotNil(t, user2.UpdatedAt) // This should have a value
+
+		user3, exists, err := cache.Get(ctx, userID3)
+		require.NoError(t, err)
+		require.True(t, exists)
+		assert.Nil(t, user3.UpdatedAt) // This should be nil
+
+		t.Logf("Cache now contains %d items", cache.lru.Len())
+
+		// This should panic with the original code due to the nil *time.Time values
+		// The panic happens in refreshCache when it tries to do:
+		// updatedAt := updatedAtValue.(time.Time)
+		// but updatedAtValue is actually *time.Time (nil)
+
+		t.Log("About to call refreshCache - this should panic with original code")
+
+		// Capture panic
+		defer func() {
+			if r := recover(); r != nil {
+				t.Logf("PANIC REPRODUCED: %v", r)
+				// This is expected with the original code
+				assert.Contains(t, fmt.Sprintf("%v", r), "interface conversion")
+				assert.Contains(t, fmt.Sprintf("%v", r), "*time.Time, not time.Time")
+			}
+		}()
+
+		// This call should panic in the original code
+		err = cache.refreshCache(ctx)
+
+		// If we reach here without panic, the fix is working
+		if err != nil {
+			t.Logf("refreshCache returned error (but didn't panic): %v", err)
+		} else {
+			t.Log("refreshCache completed successfully - fix is working!")
+		}
+	})
+}
+
+// Test that verifies the fix works correctly
+func TestTimePointerFixed(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	postgres, db, err := startPostgresContainer(ctx)
+	require.NoError(t, err)
+	defer postgres.Terminate(ctx)
+	defer db.Close()
+
+	schema := "test_schema"
+	table := "users_fixed_test"
+	err = setupTestTableWithNullableTimestamp(db, schema, table)
+	require.NoError(t, err)
+
+	config := CacheConfig{
+		Schema:             schema,
+		TableName:          table,
+		IDFieldName:        "ID",
+		UpdatedAtFieldName: "UpdatedAt",
+		ChannelName:        "fixed_cache_test",
+		MaxSize:            100,
+		Context:            ctx,
+	}
+
+	cache, err := NewCache[TestUserWithPointer, uuid.UUID](db, config)
+	require.NoError(t, err)
+	defer cache.Shutdown()
+
+	// Insert test data with various timestamp scenarios
+	testData := []struct {
+		name      string
+		hasTime   bool
+		timeValue *time.Time
+	}{
+		{"User with NULL", false, nil},
+		{"User with timestamp", true, func() *time.Time { t := time.Now(); return &t }()},
+		{"Another NULL user", false, nil},
+		{"Old timestamp user", true, func() *time.Time { t := time.Now().Add(-1 * time.Hour); return &t }()},
+	}
+
+	userIDs := make([]uuid.UUID, len(testData))
+	for i, data := range testData {
+		userIDs[i] = uuid.New()
+
+		if data.hasTime {
+			_, err = db.ExecContext(ctx, fmt.Sprintf(`INSERT INTO "%s"."%s" (id, name, updated_at) VALUES ($1, $2, $3)`, schema, table),
+				userIDs[i], data.name, data.timeValue)
+		} else {
+			_, err = db.ExecContext(ctx, fmt.Sprintf(`INSERT INTO "%s"."%s" (id, name, updated_at) VALUES ($1, $2, NULL)`, schema, table),
+				userIDs[i], data.name)
+		}
+		require.NoError(t, err)
+	}
+
+	// Load all users into cache
+	for i, userID := range userIDs {
+		user, exists, err := cache.Get(ctx, userID)
+		require.NoError(t, err)
+		require.True(t, exists)
+		assert.Equal(t, testData[i].name, user.Name)
+
+		if testData[i].hasTime {
+			assert.NotNil(t, user.UpdatedAt)
+		} else {
+			assert.Nil(t, user.UpdatedAt)
+		}
+	}
+
+	// This should NOT panic after applying the fix
+	assert.NotPanics(t, func() {
+		err := cache.refreshCache(ctx)
+		assert.NoError(t, err)
+	}, "refreshCache should handle *time.Time (nil) values correctly after fix")
+
+	// Verify cache still works after refresh
+	for i, userID := range userIDs {
+		user, exists, err := cache.Get(ctx, userID)
+		require.NoError(t, err)
+		require.True(t, exists)
+		assert.Equal(t, testData[i].name, user.Name)
+	}
+}

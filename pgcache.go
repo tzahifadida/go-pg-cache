@@ -396,15 +396,38 @@ func (c *Cache[C, ID]) refreshCache(ctx context.Context) error {
 	var mostRecentUpdate time.Time
 
 	c.mutex.RLock()
-	for id, el := range c.cache {
-		cachedIDs = append(cachedIDs, id)
-		itemValue := reflect.ValueOf(el.Value.(cacheItem[C, ID]).value)
-		updatedAt := itemValue.FieldByIndex(c.updatedAtField.Index).Interface().(time.Time)
-		if updatedAt.After(mostRecentUpdate) {
-			mostRecentUpdate = updatedAt
+	extractCacheInfo := func() error {
+		defer c.mutex.RUnlock()
+
+		for id, el := range c.cache {
+			cachedIDs = append(cachedIDs, id)
+			itemValue := reflect.ValueOf(el.Value.(cacheItem[C, ID]).value)
+			updatedAtValue := itemValue.FieldByIndex(c.updatedAtField.Index).Interface()
+
+			// Handle both time.Time and *time.Time
+			var updatedAt time.Time
+			switch v := updatedAtValue.(type) {
+			case time.Time:
+				updatedAt = v
+			case *time.Time:
+				if v != nil {
+					updatedAt = *v
+				}
+				// If v is nil, updatedAt remains zero value
+			default:
+				return fmt.Errorf("unexpected type for updated_at field: %T", v)
+			}
+
+			if updatedAt.After(mostRecentUpdate) {
+				mostRecentUpdate = updatedAt
+			}
 		}
+		return nil
 	}
-	c.mutex.RUnlock()
+
+	if err := extractCacheInfo(); err != nil {
+		return err
+	}
 
 	if len(cachedIDs) == 0 {
 		return nil
@@ -454,14 +477,15 @@ func (c *Cache[C, ID]) refreshCache(ctx context.Context) error {
 	}
 
 	c.mutex.Lock()
-	for _, id := range toRemoveIDs {
-		if el, exists := c.cache[id]; exists {
-			c.lru.Remove(el)
-			delete(c.cache, id)
+	func() {
+		defer c.mutex.Unlock()
+		for _, id := range toRemoveIDs {
+			if el, exists := c.cache[id]; exists {
+				c.lru.Remove(el)
+				delete(c.cache, id)
+			}
 		}
-	}
-	c.mutex.Unlock()
-
+	}()
 	return nil
 }
 
